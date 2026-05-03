@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models, transforms
 from torchvision.models.video import r3d_18
-import numpy as np
+import numpy as np   # ✅ ADDED
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="CCTV Crime Detection", layout="wide")
@@ -14,19 +14,15 @@ st.markdown("<h1 style='text-align:center;'>🚨 CCTV Crime Detection System</h1
 device = "cuda" if torch.cuda.is_available() else "cpu"
 st.write(f"Device: {device}")
 
-# ---------------- PARAMETERS ----------------
-SEQUENCE_LEN = 16   # reduced for faster detection
-S1_TH = 0.005
-S2_TH = 0.15
-S3_VOTE_TH = 0.01
-VOTE_COUNT = 1
-
-# ---------------- TRANSFORM ----------------
-tf = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
-])
+# ---------------- STAGE-0 FUNCTION ----------------
+def motion_score(frames):   # ✅ ADDED
+    diffs = []
+    for i in range(len(frames)-1):
+        f1 = cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY)
+        f2 = cv2.cvtColor(frames[i+1], cv2.COLOR_BGR2GRAY)
+        diff = cv2.absdiff(f1, f2)
+        diffs.append(diff.mean())
+    return np.mean(diffs)
 
 # ---------------- LOAD MODELS ----------------
 @st.cache_resource
@@ -71,11 +67,22 @@ def load_models():
     s3 = s3.to(device)
     s3.eval()
 
-    return s1, s2, s3
+    return s1,s2,s3
+
 
 stage1, stage2, stage3 = load_models()
 
-# ---------------- SESSION ----------------
+# ---------------- TRANSFORM ----------------
+tf = transforms.Compose([
+    transforms.ToTensor()
+])
+
+# ---------------- PARAMETERS ----------------
+SEQUENCE_LEN = 32
+S1_TH = 0.03
+S2_TH = 0.38
+S3_TH = 0.4
+
 if "run_detection" not in st.session_state:
     st.session_state.run_detection = False
 
@@ -86,10 +93,10 @@ tab_cam, tab_manual = st.tabs(["📡 Camera", "📂 Manual Test"])
 with tab_cam:
 
     st.subheader("Live Camera")
+
     run = st.checkbox("Start Camera")
 
     status_box = st.empty()
-    debug_box = st.empty()
 
     col1, col2, col3 = st.columns([1,2,1])
     frame_box = col2.empty()
@@ -97,16 +104,17 @@ with tab_cam:
     if run:
 
         cap = cv2.VideoCapture(0)
+
         clip = []
         s3_scores = []
 
-        while True:
+        for _ in range(300):
 
             ret, frame = cap.read()
             if not ret:
                 break
 
-            frame = cv2.resize(frame, (224,224))
+            frame = cv2.resize(frame, (600, 500))
             frame_box.image(frame, channels="BGR")
 
             clip.append(frame)
@@ -114,49 +122,53 @@ with tab_cam:
             if len(clip) < SEQUENCE_LEN:
                 continue
 
-            # -------- S1 --------
+            # ---------------- S0 MOTION ----------------
+            motion = motion_score(clip[-SEQUENCE_LEN:])
+            if motion < 6:
+                status_box.info("S0: No Motion")
+                clip.pop(0)
+                continue
+            # ------------------------------------------
+
             img = tf(clip[-1]).unsqueeze(0).to(device)
             s1_prob = torch.softmax(stage1(img),1)[0,1].item()
 
-            # -------- S2 --------
-            clip_t = torch.stack([tf(f) for f in clip]).unsqueeze(0).to(device)
-            s2_prob = torch.sigmoid(stage2(clip_t)).item()
+            if s1_prob <= S1_TH:
+                status_box.success("S1: Not Detected")
 
-            # -------- S3 --------
-            clip3 = clip_t.permute(0,2,1,3,4)
-            clip3 = F.interpolate(clip3, size=(32,128,128))
-            s3_prob = torch.sigmoid(stage3(clip3)).item()
-
-            # voting
-            s3_scores.append(s3_prob)
-            if len(s3_scores) > 5:
-                s3_scores.pop(0)
-
-            votes = sum(p > S3_VOTE_TH for p in s3_scores)
-
-            # decision
-            if (s2_prob > S2_TH and votes >= VOTE_COUNT):
-                status_box.error(f"🚨 CRIME ({s3_prob:.3f})")
             else:
-                status_box.success(f"Normal ({s3_prob:.3f})")
+                clip_t = torch.stack([tf(f) for f in clip]).unsqueeze(0).to(device)
+                s2_prob = torch.sigmoid(stage2(clip_t)).item()
 
-            # debug info
-            debug_box.write({
-                "S1": round(s1_prob,3),
-                "S2": round(s2_prob,3),
-                "S3": round(s3_prob,3),
-                "votes": votes
-            })
+                if s2_prob <= S2_TH:
+                    status_box.info("S2: Not Detected")
 
-            # sliding window (IMPORTANT FIX)
+                else:
+                    clip3 = clip_t.permute(0,2,1,3,4)
+                    clip3 = F.interpolate(clip3, size=(32,128,128))
+
+                    s3_prob = torch.sigmoid(stage3(clip3)).item()
+
+                    s3_scores.append(s3_prob)
+                    if len(s3_scores) > 5:
+                        s3_scores.pop(0)
+
+                    votes = sum(p > 0.03 for p in s3_scores)
+
+                    if votes >= 3:
+                        status_box.error("S3: Detected")
+                    else:
+                        status_box.warning("S3: Not Detected")
+
             clip.pop(0)
 
         cap.release()
 
-# ================= MANUAL =================
+# ================= MANUAL TEST =================
 with tab_manual:
 
     st.subheader("📂 Upload Video for Testing")
+
     uploaded_file = st.file_uploader("Upload CCTV Video", type=["mp4","avi","mov"])
 
     if uploaded_file is not None:
@@ -174,12 +186,14 @@ with tab_manual:
             cap = cv2.VideoCapture("temp_video.mp4")
 
             frames = []
+
+            s1_flag = False
+            s2_flag = False
+            s3_flag = False
             s3_scores = []
-            detected = False
 
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             progress = st.progress(0)
-            debug_box = st.empty()
 
             count = 0
 
@@ -196,40 +210,50 @@ with tab_manual:
 
                 if len(frames) == SEQUENCE_LEN:
 
+                    # ---------------- S0 MOTION ----------------
+                    motion = motion_score(frames)
+                    if motion < 6:
+                        frames = []
+                        continue
+                    # ------------------------------------------
+
                     img = tf(frames[-1]).unsqueeze(0).to(device)
                     s1_prob = torch.softmax(stage1(img),1)[0,1].item()
 
-                    clip_t = torch.stack([tf(f) for f in frames]).unsqueeze(0).to(device)
-                    s2_prob = torch.sigmoid(stage2(clip_t)).item()
+                    if s1_prob > S1_TH:
+                        s1_flag = True
 
-                    clip3 = clip_t.permute(0,2,1,3,4)
-                    clip3 = F.interpolate(clip3, size=(32,128,128))
-                    s3_prob = torch.sigmoid(stage3(clip3)).item()
+                        clip_t = torch.stack([tf(f) for f in frames]).unsqueeze(0).to(device)
+                        s2_prob = torch.sigmoid(stage2(clip_t)).item()
 
-                    s3_scores.append(s3_prob)
-                    if len(s3_scores) > 5:
-                        s3_scores.pop(0)
+                        if s2_prob > S2_TH:
+                            s2_flag = True
 
-                    votes = sum(p > S3_VOTE_TH for p in s3_scores)
+                            clip3 = clip_t.permute(0,2,1,3,4)
+                            clip3 = F.interpolate(clip3, size=(32,128,128))
 
-                    if (s2_prob > S2_TH and votes >= VOTE_COUNT):
-                        detected = True
+                            s3_prob = torch.sigmoid(stage3(clip3)).item()
 
-                    debug_box.write({
-                        "S1": round(s1_prob,3),
-                        "S2": round(s2_prob,3),
-                        "S3": round(s3_prob,3),
-                        "votes": votes
-                    })
+                            s3_scores.append(s3_prob)
+                            if len(s3_scores) > 5:
+                                s3_scores.pop(0)
 
-                    # sliding window
-                    frames.pop(0)
+                            votes = sum(p > 0.01 for p in s3_scores)
+
+                            if votes >= 3:
+                                s3_flag = True
+
+                    frames = []
 
             cap.release()
 
-            st.subheader("🔍 Final Result")
+            st.subheader("🔍 Final Pipeline Result")
 
-            if detected:
-                st.error("🚨 CRIME DETECTED")
+            st.write(f"S1: {'Detected' if s1_flag else 'Not Detected'}")
+            st.write(f"S2: {'Detected' if s2_flag else 'Not Detected'}")
+            st.write(f"S3: {'Detected' if s3_flag else 'Not Detected'}")
+
+            if s3_flag:
+                st.error("🚨 FINAL RESULT: CRIME DETECTED")
             else:
-                st.success("✅ NO CRIME")
+                st.success("✅ FINAL RESULT: NO CRIME")
